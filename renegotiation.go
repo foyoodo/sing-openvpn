@@ -26,7 +26,6 @@ const (
 type tlsRenegotiationState struct {
 	keyID          uint8
 	sequence       uint64
-	initiator      bool
 	mustNegotiate  time.Time
 	sessionManager *proto.SessionManager
 	channel        *tlsControlChannel
@@ -68,7 +67,7 @@ func (s *tlsPeerSession) handleIncomingSoftResetPacket(packet *proto.Packet) {
 	if packet == nil || packet.KeyID == 0 || packet.KeyID > proto.KeyIDMaxValue {
 		return
 	}
-	state, created, err := s.beginSoftReset(packet.KeyID, false)
+	state, created, err := s.beginSoftReset(packet.KeyID)
 	if err != nil || state == nil {
 		return
 	}
@@ -95,10 +94,10 @@ func (s *tlsPeerSession) beginLocalSoftReset() (*tlsRenegotiationState, bool, er
 	}
 
 	_, currentKeyID := s.currentSendCodec()
-	return s.beginSoftReset(proto.NextKeyID(currentKeyID), true)
+	return s.beginSoftReset(proto.NextKeyID(currentKeyID))
 }
 
-func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenegotiationState, bool, error) {
+func (s *tlsPeerSession) beginSoftReset(keyID uint8) (*tlsRenegotiationState, bool, error) {
 	if keyID == 0 || keyID > proto.KeyIDMaxValue {
 		return nil, false, E.New("tls mode: invalid soft-reset key-id: ", keyID)
 	}
@@ -134,7 +133,6 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenego
 	state := &tlsRenegotiationState{
 		keyID:          keyID,
 		sequence:       s.renegotiationSequence,
-		initiator:      initiator,
 		mustNegotiate:  time.Now().Add(s.handshakeWindow),
 		sessionManager: stateManager,
 		done:           make(chan struct{}),
@@ -162,15 +160,18 @@ func (s *tlsPeerSession) beginSoftReset(keyID uint8, initiator bool) (*tlsRenego
 	return state, true, nil
 }
 
+// Upstream session_move_pre_start sends P_CONTROL_SOFT_RESET_V1 as reliable
+// packet 0 of every new key state. A peer that only receives the soft reset
+// still has to send its own before any P_CONTROL_V1; the acknowledgment for
+// the peer's packet 0 rides on that reply.
 func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState, incomingSoftReset *proto.Packet) {
-	if state.initiator {
-		softResetErr := state.channel.sendInitialSoftReset()
-		if softResetErr != nil {
-			s.finishSoftReset(state, nil, softResetErr)
-			return
-		}
-	} else if incomingSoftReset != nil {
+	if incomingSoftReset != nil {
 		state.channel.processIncomingControlPacket(incomingSoftReset)
+	}
+	softResetErr := state.channel.sendInitialSoftReset()
+	if softResetErr != nil {
+		s.finishSoftReset(state, nil, softResetErr)
+		return
 	}
 
 	newCodec, err := s.roleCallbacks.renegotiate(s, state.channel, state.mustNegotiate)
