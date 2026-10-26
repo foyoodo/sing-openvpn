@@ -140,62 +140,22 @@ func waitForObservedCredentials(t *testing.T, credentialEvents <-chan observedAu
 	}
 }
 
+const softResetObservationTimeout = 30 * time.Second
+
 // A server-initiated soft reset must be answered with P_CONTROL_SOFT_RESET_V1
 // before the reliable control stream carries a TLS record.
 func TestTLSClientAnswersServerSoftResetBeforeControl(t *testing.T) {
 	t.Parallel()
-	listenAddress := reserveListenAddressForProtocol(t, "udp")
-	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancelServerContext()
-	server, err := NewServer(ServerOptions{
-		Context:   serverContext,
-		Mode:      ModeTLS,
-		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
-		TLS: ServerTLSOptions{
-			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
-			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
-			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.key")},
-		},
-		Timing: ServerTimingOptions{RenegotiationInterval: 2 * time.Second},
-		Tunnel: ServerTunnelOptions{
-			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/24")},
-			Topology:     "subnet",
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer server.Close()
-	err = server.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-	relayAddress, observations := startControlObservationRelay(t, listenAddress)
+	observations := startObservedTLSSession(t, ServerTimingOptions{RenegotiationInterval: 2 * time.Second}, ClientTimingOptions{RenegotiationDisabled: true})
+	waitForSoftResetReply(t, observations, false, softResetObservationTimeout)
+}
 
-	clientContext, cancelClientContext := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancelClientContext()
-	client, err := NewClient(ClientOptions{
-		Context:   clientContext,
-		Mode:      ModeTLS,
-		Transport: clientTransportOptions(t, relayAddress, "udp"),
-		TLS: ClientTLSOptions{
-			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
-			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.crt")},
-			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.key")},
-		},
-		Pull:   ClientPullOptions{Enabled: true},
-		Timing: ClientTimingOptions{RenegotiationDisabled: true},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer client.Close()
-	err = client.Start()
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForClientReady(t, client, 10*time.Second)
-	waitForClientSoftResetReply(t, observations, 20*time.Second)
+// A client-initiated soft reset must be answered with P_CONTROL_SOFT_RESET_V1
+// before the reliable control stream carries a TLS record.
+func TestTLSServerAnswersClientSoftResetBeforeControl(t *testing.T) {
+	t.Parallel()
+	observations := startObservedTLSSession(t, ServerTimingOptions{RenegotiationDisabled: true}, ClientTimingOptions{RenegotiationInterval: 2 * time.Second})
+	waitForSoftResetReply(t, observations, true, softResetObservationTimeout)
 }
 
 type observedControlPacket struct {
@@ -225,48 +185,121 @@ func (r *controlObservationRelay) record(fromClient bool, rawPacket []byte) {
 	r.access.Unlock()
 }
 
-func waitForClientSoftResetReply(t *testing.T, relay *controlObservationRelay, timeout time.Duration) {
+func startObservedTLSSession(t *testing.T, serverTiming ServerTimingOptions, clientTiming ClientTimingOptions) *controlObservationRelay {
+	t.Helper()
+	listenAddress := reserveListenAddressForProtocol(t, "udp")
+	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancelServerContext)
+	server, err := NewServer(ServerOptions{
+		Context:   serverContext,
+		Mode:      ModeTLS,
+		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
+		TLS: ServerTLSOptions{
+			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
+			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.crt")},
+			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "server.key")},
+		},
+		Timing: serverTiming,
+		Tunnel: ServerTunnelOptions{
+			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/24")},
+			Topology:     "subnet",
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = server.Close() })
+	err = server.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	relayAddress, observations := startControlObservationRelay(t, listenAddress)
+
+	clientContext, cancelClientContext := context.WithTimeout(context.Background(), 90*time.Second)
+	t.Cleanup(cancelClientContext)
+	client, err := NewClient(ClientOptions{
+		Context:   clientContext,
+		Mode:      ModeTLS,
+		Transport: clientTransportOptions(t, relayAddress, "udp"),
+		TLS: ClientTLSOptions{
+			CertificateAuthority: Material{Path: filepath.Join("testdata", "openvpn", "pki", "ca.crt")},
+			Certificate:          Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.crt")},
+			Key:                  Material{Path: filepath.Join("testdata", "openvpn", "pki", "client.key")},
+		},
+		Pull:   ClientPullOptions{Enabled: true},
+		Timing: clientTiming,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = client.Close() })
+	err = client.Start()
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitForClientReady(t, client, 10*time.Second)
+	return observations
+}
+
+type softResetReplyObservation int
+
+const (
+	softResetReplyPending softResetReplyObservation = iota
+	softResetReplyComplete
+	softResetReplyControlBeforeReset
+)
+
+func waitForSoftResetReply(t *testing.T, relay *controlObservationRelay, initiatorFromClient bool, timeout time.Duration) {
 	t.Helper()
 	deadline := time.Now().Add(timeout)
 	for time.Now().Before(deadline) {
-		if relay.sawSoftResetReply() {
+		switch relay.softResetReplyObservation(initiatorFromClient) {
+		case softResetReplyComplete:
 			return
+		case softResetReplyControlBeforeReset:
+			t.Fatal("P_CONTROL_V1 on the new key appeared before P_CONTROL_SOFT_RESET_V1 packet id 0")
 		}
 		time.Sleep(interopPollInterval)
 	}
-	t.Fatal("timed out waiting for a client soft reset with reliable id 0 and a following control record")
+	t.Fatal("timed out waiting for a soft reset reply with reliable id 0 before any control record")
 }
 
-func (r *controlObservationRelay) sawSoftResetReply() bool {
+func (r *controlObservationRelay) softResetReplyObservation(initiatorFromClient bool) softResetReplyObservation {
 	r.access.Lock()
 	defer r.access.Unlock()
-	var serverSoftReset *proto.Packet
+	var initiatorSoftReset *proto.Packet
 	acknowledged := false
 	sawControl := false
 	for _, observation := range r.observations {
 		packet := observation.packet
-		if !observation.fromClient && packet.Opcode == proto.OpcodeControlSoftResetV1 && packet.KeyID != 0 {
-			if serverSoftReset == nil {
-				serverSoftReset = packet
+		if observation.fromClient == initiatorFromClient && packet.Opcode == proto.OpcodeControlSoftResetV1 && packet.KeyID != 0 {
+			if initiatorSoftReset == nil {
+				initiatorSoftReset = packet
 			}
 			continue
 		}
-		if serverSoftReset == nil || !observation.fromClient || packet.KeyID != serverSoftReset.KeyID {
+		if initiatorSoftReset == nil || observation.fromClient == initiatorFromClient || packet.KeyID != initiatorSoftReset.KeyID {
 			continue
 		}
 		if packet.Opcode == proto.OpcodeControlSoftResetV1 && packet.ID == 0 {
 			for _, packetID := range packet.AcknowledgmentIDs {
-				if packetID == serverSoftReset.ID {
+				if packetID == initiatorSoftReset.ID {
 					acknowledged = true
 					break
 				}
 			}
 		}
 		if packet.Opcode == proto.OpcodeControlV1 && packet.ID >= 1 {
+			if !acknowledged {
+				return softResetReplyControlBeforeReset
+			}
 			sawControl = true
 		}
 	}
-	return acknowledged && sawControl
+	if acknowledged && sawControl {
+		return softResetReplyComplete
+	}
+	return softResetReplyPending
 }
 
 func startControlObservationRelay(t *testing.T, serverAddress string) (string, *controlObservationRelay) {
