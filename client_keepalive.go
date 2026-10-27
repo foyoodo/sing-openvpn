@@ -252,6 +252,9 @@ func (k *tlsClientKeepalive) requestSoftReset() {
 	k.renegotiationInProgress = true
 	k.access.Unlock()
 	go func() {
+		// A handshake failure finishes the session so the supervisor sends a
+		// new HARD_RESET. The error is not ignored; triggerSoftReset reports
+		// it after runSoftResetState has already restarted the session.
 		_ = k.session.triggerSoftReset()
 		k.access.Lock()
 		k.renegotiationInProgress = false

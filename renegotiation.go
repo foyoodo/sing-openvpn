@@ -171,14 +171,36 @@ func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState, incomin
 	softResetErr := state.channel.sendInitialSoftReset()
 	if softResetErr != nil {
 		s.finishSoftReset(state, nil, softResetErr)
+		s.restartSessionAfterFailedSoftReset(softResetErr)
 		return
 	}
 
 	newCodec, err := s.roleCallbacks.renegotiate(s, state.channel, state.mustNegotiate)
 	s.finishSoftReset(state, newCodec, err)
-	if err != nil && E.IsMulti(err, ErrAuthenticationFailed) && s.hooks.sessionTerminated != nil {
-		go s.hooks.sessionTerminated(err)
+	if err != nil {
+		s.restartSessionAfterFailedSoftReset(err)
 	}
+}
+
+// Upstream tls_multi_process (ssl.c): TM_ACTIVE hitting S_ERROR increments
+// n_soft_errors and reinitializes that session with tls_session_init — a new
+// HARD_RESET and session id — while a lame-duck key may still decrypt. AUTH_FAILED
+// still kills the instance. The client supervisor is this library's equivalent
+// of that reinit, so a failed client soft reset has to finish the session;
+// swallowing the error leaves Ready() true on a dead key and never sends a
+// HARD_RESET after the peer has forgotten the session.
+func (s *tlsPeerSession) restartSessionAfterFailedSoftReset(err error) {
+	if err == nil || s.hooks.sessionTerminated == nil {
+		return
+	}
+	if s.role != tlsRoleClient && !E.IsMulti(err, ErrAuthenticationFailed) {
+		return
+	}
+	if s.role == tlsRoleClient {
+		s.hooks.sessionTerminated(err)
+		return
+	}
+	go s.hooks.sessionTerminated(err)
 }
 
 func (s *tlsPeerSession) finishSoftReset(state *tlsRenegotiationState, codec dataCodec, err error) {

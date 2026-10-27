@@ -594,6 +594,9 @@ func (c *tlsClient) runRenegotiation(channel *tlsControlChannel, mustNegotiate t
 	}
 	handshakeErr := tlsConnection.Handshake()
 	if handshakeErr != nil {
+		if E.IsTimeout(handshakeErr) {
+			return nil, E.Extend(ErrHandshakeTimeout, handshakeErr.Error())
+		}
 		return nil, handshakeErr
 	}
 	channel.setTLSConnection(tlsConnection)
