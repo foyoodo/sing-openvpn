@@ -17,7 +17,14 @@ const (
 	expiredSessionRenegotiationInterval = 2 * time.Second
 	expiredSessionHandWindow            = 2 * time.Second
 	expiredSessionServerPingRestart     = 3 * time.Second
+	expiredSessionPushedPingInterval    = time.Second
+	expiredSessionPushedPingRestart     = 3 * time.Second
 )
+
+type offlineExpiryReconnectOptions struct {
+	clientPingRestartDisabled bool
+	pushKeepalive             bool
+}
 
 // OpenVPN's default --reneg-sec is 3600s. While the network is down across
 // that point, tls_process starts a soft reset whose new key_state must
@@ -30,11 +37,27 @@ const (
 // keepalive; it has to come from the failed soft reset.
 func TestClientReconnectsAfterOfflineRenegotiationExpiry(t *testing.T) {
 	t.Parallel()
+	runOfflineExpiryReconnect(t, offlineExpiryReconnectOptions{clientPingRestartDisabled: true})
+}
+
+// Production servers typically push keepalive 10 120. That arms client
+// ping-restart independently of reneg-sec. An in-flight soft reset does
+// not suppress ping-restart, and outgoing control retransmits only stamp
+// lastOutbound, so a blackhole longer than ping-restart recovers even
+// without the failed-soft-reset restart. This variant uses a scaled-down
+// push (ping 1 / ping-restart 3) to lock that path in.
+func TestClientReconnectsAfterOfflineOutageWithPushedKeepalive(t *testing.T) {
+	t.Parallel()
+	runOfflineExpiryReconnect(t, offlineExpiryReconnectOptions{pushKeepalive: true})
+}
+
+func runOfflineExpiryReconnect(t *testing.T, options offlineExpiryReconnectOptions) {
+	t.Helper()
 	listenAddress := reserveListenAddressForProtocol(t, "udp")
 
 	serverContext, cancelServerContext := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelServerContext()
-	server, err := NewServer(ServerOptions{
+	serverOptions := ServerOptions{
 		Context:   serverContext,
 		Mode:      ModeTLS,
 		Transport: ServerTransportOptions{ListenAddress: listenAddress, Protocol: "udp"},
@@ -51,7 +74,16 @@ func TestClientReconnectsAfterOfflineRenegotiationExpiry(t *testing.T) {
 			AddressPools: []netip.Prefix{netip.MustParsePrefix("10.8.0.0/24")},
 			Topology:     "subnet",
 		},
-	})
+	}
+	if options.pushKeepalive {
+		serverOptions.Push = ServerPushOptions{
+			PingInterval:        expiredSessionPushedPingInterval,
+			PingIntervalEnabled: true,
+			PingRestart:         expiredSessionPushedPingRestart,
+			PingRestartEnabled:  true,
+		}
+	}
+	server, err := NewServer(serverOptions)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -79,7 +111,7 @@ func TestClientReconnectsAfterOfflineRenegotiationExpiry(t *testing.T) {
 		Timing: ClientTimingOptions{
 			RenegotiationInterval: expiredSessionRenegotiationInterval,
 			HandWindow:            expiredSessionHandWindow,
-			PingRestartDisabled:   true,
+			PingRestartDisabled:   options.clientPingRestartDisabled,
 		},
 		OnTunnelConfiguration: func(event TunnelConfigurationEvent) error {
 			eventCh <- event
@@ -98,6 +130,12 @@ func TestClientReconnectsAfterOfflineRenegotiationExpiry(t *testing.T) {
 	firstEvent := waitForSupervisorTunnelConfigurationEvent(t, eventCh, 10*time.Second)
 	if firstEvent.Reason != TunnelConfigurationEventInitial {
 		t.Fatalf("unexpected first event reason: %s", firstEvent.Reason)
+	}
+	if options.pushKeepalive {
+		configuration := client.TunnelConfiguration()
+		if configuration.PingRestart != expiredSessionPushedPingRestart {
+			t.Fatalf("expected pushed ping-restart %v, got %v", expiredSessionPushedPingRestart, configuration.PingRestart)
+		}
 	}
 	err = tryEchoClientThroughServer(client, server, []byte("before-expiry"), 5*time.Second)
 	if err != nil {

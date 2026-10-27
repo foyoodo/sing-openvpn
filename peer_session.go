@@ -163,6 +163,12 @@ func (s *tlsPeerSession) markClosing() {
 	s.softResetAccess.Unlock()
 }
 
+func (s *tlsPeerSession) isClosing() bool {
+	s.lifecycleAccess.Lock()
+	defer s.lifecycleAccess.Unlock()
+	return s.closed
+}
+
 func (s *tlsPeerSession) installInitialControlChannel(channel *tlsControlChannel, tlsConnection *tls.Conn) bool {
 	if channel == nil || tlsConnection == nil {
 		return false

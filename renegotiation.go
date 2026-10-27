@@ -189,6 +189,14 @@ func (s *tlsPeerSession) runSoftResetState(state *tlsRenegotiationState, incomin
 // of that reinit, so a failed client soft reset has to finish the session;
 // swallowing the error leaves Ready() true on a dead key and never sends a
 // HARD_RESET after the peer has forgotten the session.
+//
+// sessionTerminated is always invoked asynchronously. On the client it is
+// tlsClient.finish, which unblocks the supervisor; the supervisor then
+// session.Close()s and waits on control-channel loopWaitGroup. Calling it
+// in-stack from runSoftResetState (which may hold renegotiation channel
+// teardown, TLS objects, or sit on the keepalive goroutine) races that
+// Close. A failure after Close/markClosing is ignored so a shutting-down
+// session does not start a spurious supervisor reconnect.
 func (s *tlsPeerSession) restartSessionAfterFailedSoftReset(err error) {
 	if err == nil || s.hooks.sessionTerminated == nil {
 		return
@@ -196,8 +204,7 @@ func (s *tlsPeerSession) restartSessionAfterFailedSoftReset(err error) {
 	if s.role != tlsRoleClient && !E.IsMulti(err, ErrAuthenticationFailed) {
 		return
 	}
-	if s.role == tlsRoleClient {
-		s.hooks.sessionTerminated(err)
+	if s.role == tlsRoleClient && s.isClosing() {
 		return
 	}
 	go s.hooks.sessionTerminated(err)
